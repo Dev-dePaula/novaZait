@@ -1,97 +1,100 @@
 (function () {
-  const cfg = window.ZAITPAY_API_CONFIG || {};
-  const BASE_URL = String(cfg.BASE_URL || "https://api.zaitpay.com.br").replace(/\/+$/, "");
-  const PREFIX = String(cfg.PREFIX || "").replace(/^\/+|\/+$/g, "");
-  const TOKEN_KEY = cfg.TOKEN_KEY || "zaitpay_access_token";
+  const cfg = window.ZAITPAY_CONFIG || {};
 
-  function buildUrl(path) {
-    const clean = String(path || "").replace(/^\/+/, "");
-    const fullPath = PREFIX ? `${PREFIX}/${clean}` : clean;
-    return `${BASE_URL}/${fullPath}`;
+  function normalizeUrl(path) {
+    const base = (cfg.BASE_URL || '').replace(/\/$/, '');
+    const prefix = (cfg.PREFIX || '').replace(/^\//, '').replace(/\/$/, '');
+    const cleanPath = String(path || '').replace(/^\//, '');
+    return [base, prefix, cleanPath].filter(Boolean).join('/');
+  }
+
+  function getToken() {
+    return localStorage.getItem('zaitpay_token') || localStorage.getItem('token') || '';
+  }
+
+  function saveAuth(payload) {
+    if (!payload || typeof payload !== 'object') return;
+    const token = payload.token || payload.accessToken || payload.access_token || payload.jwt;
+    if (token) {
+      localStorage.setItem('zaitpay_token', token);
+      localStorage.setItem('token', token);
+    }
+    const user = payload.user || payload.usuario || payload.data?.user || payload.data?.usuario;
+    if (user) localStorage.setItem('activeUser', JSON.stringify(user));
   }
 
   async function request(path, options = {}) {
-    const token = localStorage.getItem(TOKEN_KEY);
-    const headers = {
-      "Content-Type": "application/json",
-      ...(options.headers || {})
-    };
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), cfg.TIMEOUT || 20000);
+    const token = getToken();
 
-    if (token) headers.Authorization = `Bearer ${token}`;
+    try {
+      const res = await fetch(normalizeUrl(path), {
+        ...options,
+        signal: controller.signal,
+        headers: {
+          'Content-Type': 'application/json',
+          'Accept': 'application/json',
+          ...(token ? { Authorization: `Bearer ${token}` } : {}),
+          ...(options.headers || {})
+        }
+      });
 
-    const res = await fetch(buildUrl(path), {
-      ...options,
-      headers,
-      body: options.body && typeof options.body !== "string" ? JSON.stringify(options.body) : options.body
-    });
+      const text = await res.text();
+      let data = null;
+      try { data = text ? JSON.parse(text) : null; } catch { data = text; }
 
-    const text = await res.text();
-    let data = null;
-    try { data = text ? JSON.parse(text) : null; } catch { data = text; }
-
-    if (!res.ok) {
-      const message = data?.message || data?.error || data?.erro || `Erro HTTP ${res.status}`;
-      throw new Error(message);
+      if (!res.ok) {
+        const msg = (data && (data.message || data.error || data.erro)) || `Erro HTTP ${res.status}`;
+        const error = new Error(msg);
+        error.status = res.status;
+        error.data = data;
+        throw error;
+      }
+      return data;
+    } finally {
+      clearTimeout(timeout);
     }
-    return data;
   }
 
-  async function tryRoutes(routes, options) {
+  async function tryEndpoints(group, options) {
+    const endpoints = cfg.ENDPOINTS?.[group] || [];
     let lastError;
-    for (const route of routes) {
+    for (const endpoint of endpoints) {
       try {
-        return await request(route, options);
+        return await request(endpoint, options);
       } catch (err) {
         lastError = err;
-        // continua tentando rotas alternativas comuns do backend
+        // Se o endpoint existe, mas rejeitou por senha/token/validação, não tenta outros.
+        if (![404, 405].includes(err.status)) throw err;
       }
     }
-    throw lastError;
+    throw lastError || new Error(`Nenhum endpoint configurado para ${group}`);
   }
 
-  window.zaitApi = {
-    baseUrl: BASE_URL,
-    setToken(token) {
-      if (token) localStorage.setItem(TOKEN_KEY, token);
-    },
-    clearToken() {
-      localStorage.removeItem(TOKEN_KEY);
-    },
+  window.ZaitPayApi = {
     request,
-
-    login(email, password) {
-      return tryRoutes(["auth/login", "login", "usuarios/login", "users/login"], {
-        method: "POST",
-        body: { email, password, senha: password }
-      });
+    saveAuth,
+    async login(email, password) {
+      const data = await tryEndpoints('login', { method: 'POST', body: JSON.stringify({ email, password }) });
+      saveAuth(data);
+      return data;
     },
-
-    register(payload) {
-      return tryRoutes(["auth/register", "register", "clientes", "users", "usuarios"], {
-        method: "POST",
-        body: payload
-      });
+    async register(payload) {
+      const data = await tryEndpoints('register', { method: 'POST', body: JSON.stringify(payload) });
+      saveAuth(data);
+      return data;
     },
-
-    createPix(payload) {
-      return tryRoutes(["pix", "transactions/pix", "transacoes/pix", "payments/pix"], {
-        method: "POST",
-        body: payload
-      });
+    async createPix(payload) {
+      return await tryEndpoints('pix', { method: 'POST', body: JSON.stringify(payload) });
     },
-
-    createBoleto(payload) {
-      return tryRoutes(["boletos", "boleto", "cobrancas/boleto", "charges/boleto"], {
-        method: "POST",
-        body: payload
-      });
+    async createBoleto(payload) {
+      return await tryEndpoints('boleto', { method: 'POST', body: JSON.stringify(payload) });
     },
-
-    createPaymentLink(payload) {
-      return tryRoutes(["payment-links", "links-pagamento", "links", "checkout/links"], {
-        method: "POST",
-        body: payload
-      });
-    }
+    async createPaymentLink(payload) {
+      return await tryEndpoints('paymentLink', { method: 'POST', body: JSON.stringify(payload) });
+    },
+    async getClientes() { return await tryEndpoints('clientes', { method: 'GET' }); },
+    async getExtrato() { return await tryEndpoints('extrato', { method: 'GET' }); }
   };
 })();
